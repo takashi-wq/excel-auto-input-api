@@ -1,118 +1,74 @@
 # app.py
-from __future__ import annotations
-
-import io
-import os
-from datetime import datetime
-from typing import Tuple
-from urllib.parse import quote
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from openpyxl import load_workbook
-from zipfile import BadZipFile
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import os, io, tempfile, urllib.parse
 
-from auto_fill_diary import process_workbook  # ← ここで中身の加工を行う
+from auto_fill_diary import process_workbook
 
-app = FastAPI(title="Excel Auto Input API", version="1.0.0")
+app = FastAPI(title="Excel Auto Input API")
 
-
-def _get_password_from_env() -> str:
-    """
-    Render/Workers どちらでも拾えるように、よく使われるキー名を順に探す。
-    例: PASSWORD / UPLOAD_PASSWORD / API_PASSWORD
-    """
-    for key in ("PASSWORD", "UPLOAD_PASSWORD", "API_PASSWORD"):
-        val = os.getenv(key)
-        if val:
-            return val
-    # 何も設定されていない場合のデフォルト（明示的に 5124 を使いたいケース用）
-    return "5124"
-
-
-def _build_content_disposition(filename: str) -> str:
-    """
-    日本語ファイル名を含む Content-Disposition を安全に生成。
-    - ASCII 版 filename は Windows 等との互換性のために「可能なら」落とし、
-      ダメそうならプレースホルダ名にする
-    - UTF-8 版は filename*=UTF-8''<percent-encoded> を付ける
-    """
-    # 不正なパス文字を除去
-    safe = filename.replace("\\", "_").replace("/", "_").replace("\n", "_").replace("\r", "_")
-    # ASCII だけの見かけのファイル名（fallback）
-    try:
-        ascii_name = safe.encode("ascii", "strict").decode("ascii")
-    except UnicodeError:
-        # どうしても ASCII にならない場合のフォールバック
-        stem, _, ext = safe.rpartition(".")
-        if not ext:
-            ext = "xlsx"
-        ascii_name = "download." + ext
-
-    utf8_name = quote(safe, safe="")  # RFC 5987 形式にパーセントエンコード
-    # ダブルクォートを避けるためにエスケープ
-    ascii_name = ascii_name.replace('"', "'")
-
-    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
-
+# CORS（必要に応じて調整）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def health():
     return {"status": "ok"}
 
-
 @app.post("/process")
 async def process(
-    file: UploadFile = File(..., description="xlsx ファイル"),
-    password: str = Form(..., description="アップロード用パスワード"),
+    file: UploadFile = File(...),
+    password: str = Form(None),
 ):
-    # パスワードチェック
-    expected = _get_password_from_env()
-    if password != expected:
+    # パスワードチェック（Render側 環境変数 UPLOAD_PASSWORD）
+    expected = os.getenv("PASSWORD") or os.getenv("UPLOAD_PASSWORD")
+    if expected and password != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 拡張子の軽いバリデーション（必須ではないが明示的に）
-    original_name = file.filename or "upload.xlsx"
-    if not original_name.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=422, detail="Only .xlsx is supported")
-
-    # ファイル読込 → openpyxl
+    # アップロードファイルを一時保存
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     try:
-        raw = await file.read()
-        if not raw:
-            raise HTTPException(status_code=400, detail="Empty file")
+        content = await file.read()
+        tmp_in.write(content)
+        tmp_in.flush()
+        tmp_in.close()
 
-        bio_in = io.BytesIO(raw)
-        wb = load_workbook(bio_in, data_only=False)  # 数式は data_only では評価されないが編集は可能
-    except BadZipFile:
-        raise HTTPException(status_code=400, detail="The file is not a valid .xlsx")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to open workbook: {e}")
+        # 変換処理（ここでテンプレートに必要な編集を実行）
+        out_path, download_name = process_workbook(
+            tmp_in.name,
+            source_filename=file.filename  # ★ 受け渡し
+        )
 
-    # ここで帳票の自動入力ロジックを実行
-    try:
-        # 返り値として（必要なら）出力ファイル名を上書きできる
-        new_name = process_workbook(wb, source_filename=original_name)
-        if new_name:
-            original_name = new_name
+        # 日本語ファイル名で返す（RFC 5987 / 6266）
+        quoted = urllib.parse.quote(download_name)
+        # 英字フォールバック（日本語を含む場合は無難な ascii 名に）
+        ascii_fallback = "updated.xlsx" if any(ord(c) > 127 for c in download_name) else download_name
+
+        headers = {
+            "Content-Disposition": f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
+        }
+
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=headers
+        )
     except HTTPException:
         raise
     except Exception as e:
+        # 例外内容をクライアントにも出す（デバッグ後はログにのみ出力へ）
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-
-    # 書き出し（ストリーミングで返却）
-    bio_out = io.BytesIO()
-    wb.save(bio_out)
-    bio_out.seek(0)
-
-    headers = {
-        "Content-Disposition": _build_content_disposition(original_name),
-        # ダウンロードの明示
-        "X-Download-Options": "noopen",
-    }
-
-    return StreamingResponse(
-        bio_out,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers=headers,
-    )
+    finally:
+        # 入力一時ファイル削除
+        try:
+            os.remove(tmp_in.name)
+        except Exception:
+            pass
