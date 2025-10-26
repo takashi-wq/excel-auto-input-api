@@ -1,83 +1,95 @@
-# app.py (debug-temp)
+# app.py
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
-import os, io, tempfile, shutil, logging, traceback
+import os
+import io
+import tempfile
+import re
+from urllib.parse import quote
+
 from openpyxl import load_workbook
-from openpyxl.utils.exceptions import InvalidFileException
-from zipfile import BadZipFile
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("app")
+# もし独自の処理モジュールを分けたい場合はここで import
+# from auto_fill_diary import process_workbook  # <- 使うならコメント解除
 
-app = FastAPI()
+app = FastAPI(title="Excel Auto Input API")
 
+# ===== ユーティリティ =====
+def get_password() -> str:
+    # Render/Workers 環境変数（設定: UPLOAD_PASSWORD=5124）
+    # なければ 5124 をデフォルトとして扱う
+    return os.getenv("UPLOAD_PASSWORD", "5124")
+
+
+def make_content_disposition(original_name: str) -> str:
+    """
+    日本語ファイル名でもエラーにならない Content-Disposition を生成。
+    - filename= は ASCII の安全名
+    - filename*= は RFC5987 (UTF-8 + URL エンコード)
+    """
+    base = os.path.splitext(os.path.basename(original_name or "updated"))[0]
+    safe_base = re.sub(r"[^A-Za-z0-9_.-]", "_", base)[:60]  # 非ASCIIを'_'に、長すぎるのもカット
+    fname = f"{safe_base}.xlsx"
+    # RFC5987 形式（日本語名でもOK）
+    return f'attachment; filename="{fname}"; filename*=UTF-8\'\'{quote(fname)}'
+
+
+def identity_process_workbook(wb):
+    """
+    ひとまず何もしない（ワークブックを開いて閉じるだけ）の安全なダミー処理。
+    実処理を作り込む場合は auto_fill_diary.py などに切り出して呼び替えてください。
+    """
+    return wb
+
+
+# ===== エンドポイント =====
 @app.get("/")
 def health():
     return {"status": "ok"}
 
+
 @app.post("/process")
 async def process(file: UploadFile = File(...), password: str = Form(None)):
-    # 認証（Render の環境変数 PASSWORD と一致）
-    expected = os.getenv("PASSWORD")
-    if expected and password != expected:
+    # パスワードチェック
+    expected = get_password()
+    if password != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # ---- まずはファイルを確実に受け取る ----
+    # 一時ファイルに保存して openpyxl で開く
     try:
+        content = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-            shutil.copyfileobj(file.file, tmp)
+            tmp.write(content)
             tmp_path = tmp.name
-        size = os.path.getsize(tmp_path)
-        log.info(f"uploaded: name={getattr(file, 'filename', None)} size={size} path={tmp_path}")
-    except Exception as e:
-        log.error("upload write error", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"upload write error: {type(e).__name__}")
 
-    try:
-        # ---- ECHO_ONLY=1 の時は openpyxl を通さず そのまま返す（切り分け用）----
-        if os.getenv("ECHO_ONLY") == "1":
-            with open(tmp_path, "rb") as f:
-                data = f.read()
-            os.remove(tmp_path)
-            name = getattr(file, "filename", None) or "uploaded.xlsx"
-            return StreamingResponse(
-                io.BytesIO(data),
-                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f'attachment; filename="{name}"'}
-            )
+        # Excel をロード
+        wb = load_workbook(tmp_path)
 
-        # ---- ここから本来の処理：openpyxl でロード ----
-        try:
-            wb = load_workbook(filename=tmp_path, data_only=False)
-        except (BadZipFile, InvalidFileException, KeyError) as e:
-            log.warning("xlsx load error (known)", exc_info=True)
-            raise HTTPException(status_code=400, detail=f"xlsx load error: {type(e).__name__}")
-        except Exception as e:
-            log.error("load_workbook error", exc_info=True)
-            raise HTTPException(status_code=400, detail=f"load_workbook error: {type(e).__name__}")
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        # ▼処理本体（現状はダミー処理）
+        # wb = process_workbook(wb)  # ←独自処理を使うならこちらに変更
+        wb = identity_process_workbook(wb)
 
-        # TODO: ここで wb をルールに従って更新する
-        # ws = wb.active など
-
+        # バイナリに書き出して返す
         bio = io.BytesIO()
         wb.save(bio)
         bio.seek(0)
-        name = getattr(file, "filename", None) or "updated.xlsx"
+
+        headers = {"Content-Disposition": make_content_disposition(file.filename or "updated.xlsx")}
         return StreamingResponse(
             bio,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{name}"'}
+            headers=headers,
         )
-
     except HTTPException:
+        # 上で投げたものはそのまま
         raise
     except Exception as e:
-        # 最後の砦：トレースバックをログし、500 ではなく 400 で詳細を返す
-        tb = traceback.format_exc()
-        log.error("unhandled error", exc_info=True)
-        return JSONResponse(status_code=400, content={"detail": f"unhandled: {type(e).__name__}", "trace": tb})
+        # 例外は 500 で返す（ログに出したい場合は print/ログ基盤へ）
+        return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {type(e).__name__}"})
+    finally:
+        # 一時ファイルの掃除
+        try:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
