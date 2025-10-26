@@ -1,152 +1,147 @@
 # app.py
-import os
-import io
-import re
-from datetime import datetime
-from urllib.parse import quote
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse
-from openpyxl import load_workbook
+from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional, List
+from pydantic import BaseModel
+import io, os, tempfile, datetime
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Excel Auto Input API")
+app = FastAPI(title="Excel Auto Fill API", version="1.0.0")
 
-# === ユーティリティ ===
-def sanitize_filename(name: str) -> str:
+PASSWORD_ENV = "PASSWORD"
+
+# ---- ユーティリティ ---------------------------------------------------------
+def read_password() -> Optional[str]:
+    return os.getenv(PASSWORD_ENV)
+
+def now_str() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_sheet(ws_name: str) -> str:
+    # レンダーログを見やすくするための短縮
+    return ws_name.replace("\n", "\\n")
+
+# ---- 実ファイル処理 ---------------------------------------------------------
+def write_debug_stamps(wb) -> List[str]:
     """
-    Windows/Excel が苦手な文字を除去。拡張子は維持。
+    すべてのワークシートの Z1 セルにデバッグ印を押す。
+    実際にどのシートに書けたか（=変更があったか）を返す。
     """
-    s = name.replace("\\", "_").replace("/", "_").replace(":", "_") \
-            .replace("*", "_").replace("?", "_").replace('"', "_") \
-            .replace("<", "_").replace(">", "_").replace("|", "_")
-    # 長すぎ対応（任意）
-    if len(s) > 150:
-        root, ext = os.path.splitext(s)
-        s = root[:140] + ext
-    return s
+    touched: List[str] = []
+    for ws in wb.worksheets:
+        try:
+            ws["Z1"] = f"DEBUG {now_str()}"
+            touched.append(ws.title)
+        except Exception as e:
+            # 書けなかったシートもログに残したい
+            touched.append(f"{ws.title} (write-error: {e})")
+    return touched
 
 
-def pick_target_sheet(wb) -> str:
+def try_fill_template(wb) -> List[str]:
     """
-    実際に書き込むシートを選ぶ。
-    - 候補に合致すればそれを、無ければアクティブシート。
+    あなたの想定テンプレに対して試し書き（少量）を行う。
+    どこに書いたかのログを返す。
+    ※位置が違う可能性があるので、まずは無害な「右上あたり」に入れる。
     """
-    candidates: List[str] = [
-        "実習日誌", "実習 日誌", "日誌", "Sheet1", "Sheet", "シート1"
-    ]
-    sheetnames = wb.sheetnames
+    logs: List[str] = []
+    # 候補：名前に「日誌」「入力」「sheet」「diary」等が含まれるシートを優先
+    candidates = []
+    for ws in wb.worksheets:
+        name = ws.title
+        key = name
+        rank = 0
+        for token in ("日誌", "入力", "diary", "sheet", "実習"):
+            if token in name:
+                rank += 1
+        candidates.append((rank, name))
+    # ランク高い順
+    candidates.sort(reverse=True)
 
-    # 完全一致優先
-    for cand in candidates:
-        if cand in sheetnames:
-            return cand
+    targets = [n for _, n in candidates[:2]] or [wb.worksheets[0].title]
+    targets = list(dict.fromkeys(targets))  # unique
 
-    # 部分一致（例: '日誌（10月）' など）
-    for cand in candidates:
-        for s in sheetnames:
-            if cand in s:
-                return s
+    for title in targets:
+        try:
+            ws = wb[title]
+            # ※結合セルにぶつからないよう、目立たず比較的安全な XFD10 の隣近辺に書く
+            ws["AA10"] = "API書込テスト：50"
+            ws["AB10"] = "API書込テスト：15"
+            logs.append(f"wrote AA10/AB10 in '{safe_sheet(title)}'")
+        except Exception as e:
+            logs.append(f"failed write in '{safe_sheet(title)}' -> {e}")
+    return logs
 
-    # フォールバック
-    return wb.active.title
+# ---- API --------------------------------------------------------------------
+@app.get("/")
+def health():
+    return {"status": "ok", "time": now_str()}
 
-
-def add_api_result_sheet(wb, original_name: str):
-    """
-    変更の痕跡が必ず残るよう、API_RESULT シートを（無ければ）追加して
-    簡単なメタ情報を書き込む。
-    """
-    sheet_name = "API_RESULT"
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        ws.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "processed", original_name])
-    else:
-        ws = wb.create_sheet(sheet_name)
-        ws["A1"] = "timestamp"
-        ws["B1"] = "status"
-        ws["C1"] = "source_filename"
-        ws.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "processed", original_name])
-
-
-def process_workbook(in_bytes: bytes, original_filename: str) -> bytes:
-    """
-    ここに本番ロジックを実装していく。まずは確実に変更が入る形。
-    """
-    # 読み込み
-    bio = io.BytesIO(in_bytes)
-    wb = load_workbook(bio, data_only=False)
-
-    # 変更が目視できるように、必ず1つのセルに印を書き込む
-    target_sheet = pick_target_sheet(wb)
-    ws = wb[target_sheet]
-
-    # 目立つ位置にスタンプ（必要なら座標は調整してください）
-    ws["B2"] = f"✅ Processed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-    # 変更履歴シートも作る/追記する
-    add_api_result_sheet(wb, original_filename)
-
-    # --- ここから下に “本命の書き込み処理” を追加していけばOK ---
-    # 例:
-    # ws["E7"] = "秋元 寛子"     # 指導者氏名（例）
-    # ws["C12"] = "パターン記号の見かた指導"  # 指導内容（例）
-    # ※ 実際のセル番地に合わせて書き換えてください。
-
-    # 保存して戻す
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.read()
-
-
-def content_disposition_for(filename: str) -> str:
-    """
-    日本語やスペースを含むファイル名に対応した Content-Disposition を作る。
-    例: attachment; filename="updated.xlsx"; filename*=UTF-8''%E6%9B%B...
-    """
-    safe = sanitize_filename(filename)
-    ascii_fallback = re.sub(r"[^\x20-\x7E]", "_", safe)  # ASCII 以外を _
-    quoted = quote(safe)
-    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted}'
-
-
-# === エンドポイント ===
 @app.post("/process")
 async def process(
-    file: UploadFile = File(...),
-    password: Optional[str] = Form(None)
+    file: UploadFile = File(..., description=".xlsx をアップロード"),
+    password: Optional[str] = Form(None, description="アップロード用パスワード（環境変数と一致が必要）"),
+    debug: Optional[bool] = Form(False, description="True で全シートの Z1 にデバッグ印"),
 ):
-    # 認証（Render の環境変数 UPLOAD_PASSWORD と一致必須）
-    expected = os.getenv("UPLOAD_PASSWORD")
-    if expected and password != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    # パスワードチェック
+    expected = read_password()
+    if expected:
+        if password != expected:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
-    # 拡張子チェック（xlsx のみ）
-    if not (file.filename.lower().endswith(".xlsx")):
-        raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
+    # 拡張子チェック
+    filename = file.filename or "uploaded.xlsx"
+    if not filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Only .xlsx is supported")
 
-    # 元ファイル名
-    original_name = file.filename or "uploaded.xlsx"
-
-    # バイト取得
-    in_bytes = await file.read()
-
+    # 一時ファイルに保存（日本語名でもOK）
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     try:
-        out_bytes = process_workbook(in_bytes, original_name)
+        content = await file.read()
+        tmp_in.write(content)
+        tmp_in.flush()
+        tmp_in.close()
+
+        # Excel を読み込んで処理
+        wb = load_workbook(tmp_in.name, data_only=False)  # 書き込み可能
+
+        # ---- ここがポイント：まず全シートにデバッグ印を打つかどうか ----
+        action_logs: List[str] = []
+        if debug:
+            touched = write_debug_stamps(wb)
+            action_logs.append(f"debug stamps -> {touched}")
+
+        # ついでに “想定テンプレ” にも軽く書いてみる（右上あたり）
+        try_logs = try_fill_template(wb)
+        action_logs.extend(try_logs)
+
+        # 保存して再読込（openpyxl の一部挙動対策）
+        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        wb.save(tmp_out.name)
+        tmp_out.flush()
+        tmp_out.close()
+
+        # レスポンスへ
+        output_name = os.path.splitext(os.path.basename(filename))[0] + " updated.xlsx"
+        with open(tmp_out.name, "rb") as fh:
+            stream = io.BytesIO(fh.read())
+
+        # レンダーのログで何が起きたか見えるように、ヘッダにも情報を少し出す
+        headers = {"X-Write-Log": "; ".join(action_logs)[:1024]}
+
+        return StreamingResponse(
+            stream,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{output_name}"', **headers},
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        # 失敗したら理由を返す（ログも併用してください）
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-
-    # ダウンロード用ファイル名
-    root, ext = os.path.splitext(sanitize_filename(original_name))
-    updated_name = f"{root}_updated{ext}"
-
-    headers = {
-        "Content-Disposition": content_disposition_for(updated_name)
-    }
-    return StreamingResponse(
-        io.BytesIO(out_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers=headers,
-    )
+    finally:
+        try:
+            os.remove(tmp_in.name)
+        except Exception:
+            pass
