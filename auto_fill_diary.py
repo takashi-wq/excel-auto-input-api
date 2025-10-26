@@ -1,48 +1,27 @@
 # auto_fill_diary.py
-from openpyxl import Workbook
-from fastapi import HTTPException
-import re
+from __future__ import annotations
 
-def _find_target_sheet(wb):
+from datetime import datetime
+from typing import Optional
+
+from openpyxl.workbook.workbook import Workbook
+
+
+def process_workbook(wb: Workbook, *, source_filename: str) -> Optional[str]:
     """
-    シート検出の例：
-    - 現在の月から推定（ここでは簡易： '日誌' を含む先頭シート）
-    - 本番はあなたのルール（例：'日誌\s*0?{M}月' の正規表現→なければフォールバック）を実装
+    ここに「エクセル自動入力」の中身を書きます。
+    返値でファイル名を差し替えたい場合は新しいファイル名（str）を返す。
+    差し替え不要なら None を返す。
+
+    ---- サンプル実装（最小） ----
+    - 最初のシートの A1 に処理日時を入れるだけ
+    - 既存値がある場合は上書きしたくない等の条件は自由に追加できます
     """
-    # まずは '日誌' を含む最も左のシート
-    for name in wb.sheetnames:
-        if "日誌" in name:
-            return wb[name]
-    # 見つからなければ一番左
-    return wb[wb.sheetnames[0]]
+    ws = wb.worksheets[0]  # 最初のワークシート
+    ws["A1"].value = f"Processed at {datetime.now():%Y-%m-%d %H:%M:%S}"
 
-def process_workbook(wb: Workbook) -> None:
-    """
-    ここに “V/X/Y/AA 列の自動入力” などのロジックを書く。
-    いまは動作確認のため ZZ1 に『処理OK』を書くだけ。
-    """
-    ws = _find_target_sheet(wb)
-
-    # --- ここから本番ロジックを書いていく ---------------------------------
-    # 例：
-    # 1) 今日の月のシートを選ぶ
-    # 2) 休日判定（U列=50 の行は V/X/Y/AA を空欄のまま）
-    # 3) 既存値があるセルは上書き禁止、空欄のみ補完
-    # 4) 参照優先：前月→同シート上方既知値
-    # 5) 実習内容コード（1〜6）は 4→3→2→5→6 の順で配分
-    # 6) 3日以上の同カテゴリ連続を回避
-    #
-    #  ※ 実シートの列位置・行範囲はテンプレート仕様に合わせて調整
-    # ---------------------------------------------------------------------
-
-    # ★動作確認の軽い書き込み（不要なら削除OK）
-    ws["ZZ1"].value = "処理OK"
-
-    # 例）もし保護されていて書けない場合はエラー
-    # try:
-    #     ws["ZZ1"].value = "処理OK"
-    # except Exception as e:
-    #     raise HTTPException(status_code=400, detail=f"シートに書き込めません: {e}")
-
-    # ここで return は不要。呼び出し側が wb を保存して返却します。
-
+    # 返却ファイル名を「元名の末尾に _processed」を付ける例
+    # （日本語名でもOK。Content-Disposition 側で UTF-8 エンコードします）
+    if source_filename.lower().endswith(".xlsx"):
+        return source_filename[:-5] + "_processed.xlsx"
+    return None
